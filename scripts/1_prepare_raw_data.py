@@ -173,9 +173,9 @@ def prepare_raw_data():
 
         # 转换格式并分类
         for idx, item in enumerate(dianjin_data):
-            # DianJin-R1-Data 格式: {input, output} 或 {question, answer}
-            question = item.get("input") or item.get("question", "")
-            answer = item.get("output") or item.get("answer", "")
+            # DianJin-R1-Data 格式: {instruction, output}
+            question = item.get("instruction", "")
+            answer = item.get("output", "")
 
             if question and answer:
                 qtype = classify_question_type(question, answer)
