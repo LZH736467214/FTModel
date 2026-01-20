@@ -19,3 +19,7 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# 过程记录文件
+.detect_plan.md
+.preparation.md
