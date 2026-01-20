@@ -444,9 +444,9 @@ class DataFilter:
         print("=" * 60)
 
 
-def split_train_test(sft_data, rl_data, test_ratio=0.2):
+def split_train_val_test(sft_data, rl_data, train_ratio=0.7, val_ratio=0.15, test_ratio=0.15):
     """
-    切分训练集和测试集
+    切分训练集、验证集和测试集
     """
     import random
     random.seed(42)
@@ -459,17 +459,28 @@ def split_train_test(sft_data, rl_data, test_ratio=0.2):
     indices = list(range(len(sft_data)))
     random.shuffle(indices)
 
-    # 切分
-    test_size = int(len(sft_data) * test_ratio)
-    test_indices = set(indices[:test_size])
+    # 计算切分点
+    total = len(sft_data)
+    train_size = int(total * train_ratio)
+    val_size = int(total * val_ratio)
+    # test_size 为剩余部分
 
-    sft_train = [sft_data[i] for i in range(len(sft_data)) if i not in test_indices]
-    sft_test = [sft_data[i] for i in range(len(sft_data)) if i in test_indices]
+    # 切分索引
+    train_indices = set(indices[:train_size])
+    val_indices = set(indices[train_size:train_size + val_size])
+    test_indices = set(indices[train_size + val_size:])
 
-    rl_train = [rl_data[i] for i in range(len(rl_data)) if i not in test_indices]
-    rl_test = [rl_data[i] for i in range(len(rl_data)) if i in test_indices]
+    # SFT 数据切分
+    sft_train = [sft_data[i] for i in range(total) if i in train_indices]
+    sft_val = [sft_data[i] for i in range(total) if i in val_indices]
+    sft_test = [sft_data[i] for i in range(total) if i in test_indices]
 
-    return sft_train, sft_test, rl_train, rl_test
+    # RL 数据切分
+    rl_train = [rl_data[i] for i in range(total) if i in train_indices]
+    rl_val = [rl_data[i] for i in range(total) if i in val_indices]
+    rl_test = [rl_data[i] for i in range(total) if i in test_indices]
+
+    return sft_train, sft_val, sft_test, rl_train, rl_val, rl_test
 
 
 def filter_data(use_judge=True):
@@ -502,16 +513,21 @@ def filter_data(use_judge=True):
         # 清理 Judge 模型
         filter_obj.cleanup_judge()
 
-    # 切分训练/测试集
-    print("\n切分训练/测试集...")
-    sft_train, sft_test, rl_train, rl_test = split_train_test(
-        sft_data, rl_data, DATA_CONFIG.test_ratio
+    # 切分训练/验证/测试集
+    print("\n切分训练/验证/测试集...")
+    sft_train, sft_val, sft_test, rl_train, rl_val, rl_test = split_train_val_test(
+        sft_data, rl_data,
+        DATA_CONFIG.train_ratio,
+        DATA_CONFIG.val_ratio,
+        DATA_CONFIG.test_ratio
     )
 
-    print(f"SFT 训练集: {len(sft_train)} 条")
-    print(f"SFT 测试集: {len(sft_test)} 条")
-    print(f"RL 训练集: {len(rl_train)} 条")
-    print(f"RL 测试集: {len(rl_test)} 条")
+    print(f"SFT 训练集: {len(sft_train)} 条 ({len(sft_train)/len(sft_data)*100:.1f}%)")
+    print(f"SFT 验证集: {len(sft_val)} 条 ({len(sft_val)/len(sft_data)*100:.1f}%)")
+    print(f"SFT 测试集: {len(sft_test)} 条 ({len(sft_test)/len(sft_data)*100:.1f}%)")
+    print(f"RL 训练集: {len(rl_train)} 条 ({len(rl_train)/len(rl_data)*100:.1f}%)")
+    print(f"RL 验证集: {len(rl_val)} 条 ({len(rl_val)/len(rl_data)*100:.1f}%)")
+    print(f"RL 测试集: {len(rl_test)} 条 ({len(rl_test)/len(rl_data)*100:.1f}%)")
 
     # 保存
     os.makedirs("data/processed", exist_ok=True)
@@ -523,7 +539,8 @@ def filter_data(use_judge=True):
 
     save_jsonl(sft_train, DATA_CONFIG.sft_data_path)
     save_jsonl(rl_train, DATA_CONFIG.rl_data_path)
-    save_jsonl(sft_test + rl_test, DATA_CONFIG.test_data_path)  # 测试集合并
+    save_jsonl(sft_val + rl_val, DATA_CONFIG.val_data_path)  # 验证集合并（SFT + RL）
+    save_jsonl(sft_test + rl_test, DATA_CONFIG.test_data_path)  # 测试集合并（SFT + RL）
 
     # 保存统计
     with open("data/processed/filter_stats.json", 'w', encoding='utf-8') as f:
@@ -532,9 +549,10 @@ def filter_data(use_judge=True):
     print(f"\n✅ 数据已保存:")
     print(f"   SFT 训练: {DATA_CONFIG.sft_data_path}")
     print(f"   RL 训练: {DATA_CONFIG.rl_data_path}")
+    print(f"   验证集: {DATA_CONFIG.val_data_path}")
     print(f"   测试集: {DATA_CONFIG.test_data_path}")
 
-    return len(sft_train), len(rl_train), len(sft_test)
+    return len(sft_train), len(rl_train), len(sft_val), len(sft_test)
 
 
 if __name__ == "__main__":
@@ -552,7 +570,10 @@ if __name__ == "__main__":
 
     print(f"Judge 模型: {'启用' if use_judge else '禁用'}")
 
-    sft_count, rl_count, test_count = filter_data(use_judge=use_judge)
+    sft_count, rl_count, val_count, test_count = filter_data(use_judge=use_judge)
     print(f"\n✅ 数据构建完成！")
-    print(f"   最终数据资产：SFT {sft_count} 条 + RL {rl_count} 条 + 测试 {test_count} 条")
+    print(f"   最终数据资产：")
+    print(f"     训练集 - SFT {sft_count} 条 + RL {rl_count} 条")
+    print(f"     验证集 - {val_count} 条")
+    print(f"     测试集 - {test_count} 条")
     print(f"\n下一步：运行 python scripts/4_train_sft.py")

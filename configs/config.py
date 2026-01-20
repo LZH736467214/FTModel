@@ -115,11 +115,14 @@ class DataConfig:
     distilled_data_path: str = "data/processed/distilled.jsonl"
     sft_data_path: str = "data/processed/sft.jsonl"
     rl_data_path: str = "data/processed/rl.jsonl"
+    val_data_path: str = "data/processed/val.jsonl"
     test_data_path: str = "data/processed/test.jsonl"
 
     # 数据规模
     total_samples: int = 500
-    test_ratio: float = 0.2
+    train_ratio: float = 0.7
+    val_ratio: float = 0.15
+    test_ratio: float = 0.15
 
     # 分层抽样配置
     type_distribution: dict = None
