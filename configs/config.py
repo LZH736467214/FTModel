@@ -54,8 +54,8 @@ class SFTConfig:
     """SFT 训练配置"""
     output_dir: str = "ckpts/sft_lora"
     num_train_epochs: int = 2
-    per_device_train_batch_size: int = 2
-    gradient_accumulation_steps: int = 8
+    per_device_train_batch_size: int = 4  # 利用32GB显存，从2提升到4
+    gradient_accumulation_steps: int = 4  # 从8降到4，保持有效batch_size=16
     learning_rate: float = 2e-4
     lr_scheduler_type: str = "cosine"
     warmup_ratio: float = 0.05
@@ -70,8 +70,8 @@ class GRPOConfig:
     """GRPO 训练配置"""
     output_dir: str = "ckpts/grpo_lora"
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 16
+    per_device_train_batch_size: int = 2  # 利用32GB显存，从1提升到2
+    gradient_accumulation_steps: int = 8  # 从16降到8，保持有效batch_size=16
     learning_rate: float = 5e-6
     num_sample_generations: int = 4
     response_length: int = 512
@@ -119,7 +119,7 @@ class DataConfig:
     test_data_path: str = "data/processed/test.jsonl"
 
     # 数据规模
-    total_samples: int = 500
+    total_samples: int = 2000
     train_ratio: float = 0.7
     val_ratio: float = 0.15
     test_ratio: float = 0.15

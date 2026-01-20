@@ -11,11 +11,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from configs.config import DATA_CONFIG
 
-MAX_DOWNLOAD_SAMPLES = 400  # 只下载前400条数据
+MAX_DOWNLOAD_SAMPLES = 2000  # 下载2000条数据（配合5条自定义数据）
 
 def download_dianjin_data():
     """
-    下载 DianJin-R1-Data 数据集（只下载前400条）
+    下载 DianJin-R1-Data 数据集（下载前2000条）
     面试点：数据来源的多样性
     """
     try:
@@ -165,7 +165,7 @@ def prepare_raw_data():
     all_data = []
 
     # 1. 加载 DianJin-R1-Data
-    print(f"\n1. 加载 DianJin-R1-Data 数据集（限制 {MAX_DOWNLOAD_SAMPLES} 条）...")
+    print(f"\n1. 加载 DianJin-R1-Data 数据集（下载 {MAX_DOWNLOAD_SAMPLES} 条）...")
     dianjin_data = download_dianjin_data()
 
     if dianjin_data:
