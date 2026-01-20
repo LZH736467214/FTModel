@@ -26,7 +26,7 @@ from typing import Dict, List, Any
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.config import MODEL_CONFIG, SFT_CONFIG, GRPO_CONFIG, DATA_CONFIG
+from configs.config import MODEL_CONFIG, SFT_CONFIG, GRPO_CONFIG, DATA_CONFIG, WANDB_CONFIG
 
 
 # ============ 评测函数（复用自 6_evaluate.py）============
@@ -246,7 +246,7 @@ def run_ablation_study(
         model, tokenizer = load_model(MODEL_CONFIG.base_model, is_lora=False)
         results = evaluate_model(model, tokenizer, test_data)
         ablation_results["base_model"] = {
-            "name": "Base Model (Qwen2.5-3B-Instruct)",
+            "name": "Base Model (Qwen2.5-1.5B-Instruct)",
             "format_accuracy": results["format_accuracy"],
             "answer_accuracy": results["answer_accuracy"],
             "by_type": results["by_type"],
@@ -385,6 +385,70 @@ def generate_report(
         }, f, ensure_ascii=False, indent=2)
 
     print(f"\n✅ 报告已保存: {report_path}")
+
+    # 记录到 wandb
+    if WANDB_CONFIG.enabled:
+        try:
+            import wandb
+
+            run_name = f"{WANDB_CONFIG.run_name_ablation}-{timestamp}"
+            wandb.init(
+                project=WANDB_CONFIG.project,
+                entity=WANDB_CONFIG.entity,
+                name=run_name,
+                config={
+                    "experiment_type": "ablation_study",
+                    "models_tested": list(ablation_results.keys()),
+                },
+                tags=["ablation", "comparison"],
+            )
+
+            # 记录每个模型的指标
+            comparison_data = []
+            for key, result in ablation_results.items():
+                if "error" not in result:
+                    wandb.log({
+                        f"{key}/format_accuracy": result["format_accuracy"],
+                        f"{key}/answer_accuracy": result["answer_accuracy"],
+                    })
+
+                    # 准备对比表格数据
+                    comparison_data.append({
+                        "model": result["name"],
+                        "format_accuracy": result["format_accuracy"],
+                        "answer_accuracy": result["answer_accuracy"],
+                    })
+
+                    # 记录按类型的结果
+                    if "by_type" in result:
+                        for qtype, stats in result["by_type"].items():
+                            wandb.log({
+                                f"{key}/{qtype}/format_accuracy": stats["format_accuracy"],
+                                f"{key}/{qtype}/answer_accuracy": stats["answer_accuracy"],
+                            })
+
+            # 创建对比表格
+            if comparison_data:
+                wandb.log({"ablation_comparison": wandb.Table(
+                    columns=["model", "format_accuracy", "answer_accuracy"],
+                    data=[[d["model"], d["format_accuracy"], d["answer_accuracy"]] for d in comparison_data]
+                )})
+
+            # 保存报告为 artifact
+            artifact = wandb.Artifact(
+                name=f"ablation-report-{timestamp}",
+                type="ablation_study",
+                description="Ablation study report comparing Base, SFT, and GRPO models",
+            )
+            artifact.add_file(report_path)
+            wandb.log_artifact(artifact)
+
+            print("✓ 消融实验结果已记录到 wandb")
+            wandb.finish()
+        except ImportError:
+            print("⚠️  wandb 未安装，跳过 wandb 日志")
+        except Exception as e:
+            print(f"⚠️  wandb 记录失败: {e}")
 
     # 生成结论
     print("\n" + "=" * 60)

@@ -1,5 +1,7 @@
 """
-SFT 训练脚本
+T3 SFT 训练阶段：只训练 Base 模型
+Base 模型：Qwen2.5-1.5B-Instruct（本地部署）
+
 核心技术点：
 1. 4bit 量化加载 (BitsAndBytesConfig)
 2. LoRA 微调 (peft)
@@ -7,7 +9,7 @@ SFT 训练脚本
 4. TRL SFTTrainer
 
 面试点：
-- 为什么要 4bit 量化？节省显存，让 3B 模型在 8GB 显卡上跑起来
+- 为什么要 4bit 量化？节省显存，让小模型训练更高效
 - 为什么用 LoRA？参数高效微调，只训练约 0.1% 的参数
 - 为什么用 SFTTrainer？TRL 库封装好的监督微调训练器
 """
@@ -28,7 +30,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.config import MODEL_CONFIG, LORA_CONFIG, SFT_CONFIG, DATA_CONFIG
+from configs.config import MODEL_CONFIG, LORA_CONFIG, SFT_CONFIG, DATA_CONFIG, WANDB_CONFIG
 
 
 def load_model_and_tokenizer():
@@ -164,6 +166,38 @@ def train_sft(model, tokenizer, dataset):
     print("开始 SFT 训练")
     print("=" * 60)
 
+    # 初始化 wandb
+    if WANDB_CONFIG.enabled:
+        try:
+            import wandb
+            from datetime import datetime
+
+            run_name = f"{WANDB_CONFIG.run_name_sft}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            wandb.init(
+                project=WANDB_CONFIG.project,
+                entity=WANDB_CONFIG.entity,
+                name=run_name,
+                config={
+                    "model": MODEL_CONFIG.base_model,
+                    "lora_r": LORA_CONFIG.r,
+                    "lora_alpha": LORA_CONFIG.lora_alpha,
+                    "epochs": SFT_CONFIG.num_train_epochs,
+                    "batch_size": SFT_CONFIG.per_device_train_batch_size,
+                    "gradient_accumulation": SFT_CONFIG.gradient_accumulation_steps,
+                    "learning_rate": SFT_CONFIG.learning_rate,
+                    "max_seq_length": MODEL_CONFIG.model_max_length,
+                },
+                tags=["sft", "base-model"],
+            )
+            print(f"✓ Wandb 已初始化: {run_name}")
+            report_to = "wandb"
+        except ImportError:
+            print("⚠️  wandb 未安装，跳过 wandb 日志")
+            report_to = "none"
+    else:
+        print("ℹ️  Wandb 未启用")
+        report_to = "none"
+
     # 创建输出目录
     os.makedirs(SFT_CONFIG.output_dir, exist_ok=True)
 
@@ -183,7 +217,7 @@ def train_sft(model, tokenizer, dataset):
         optim=SFT_CONFIG.optim,
         max_seq_length=MODEL_CONFIG.model_max_length,
         dataset_text_field="text",  # 指定文本字段
-        report_to="none",  # 不使用 wandb（可改为 "wandb"）
+        report_to=report_to,  # wandb 日志
         gradient_checkpointing=True,  # 节省显存
         # 其他优化
         remove_unused_columns=True,
@@ -219,6 +253,14 @@ def train_sft(model, tokenizer, dataset):
 
     print(f"\n✅ SFT 训练完成！")
     print(f"   模型已保存至: {SFT_CONFIG.output_dir}")
+
+    # 结束 wandb
+    if WANDB_CONFIG.enabled:
+        try:
+            import wandb
+            wandb.finish()
+        except:
+            pass
 
     return trainer
 
@@ -267,7 +309,8 @@ def test_generation(model, tokenizer):
 def main():
     """主函数"""
     print("=" * 60)
-    print("金融推理模型 SFT 训练")
+    print("T3 SFT 训练阶段：训练 Base 模型")
+    print(f"Base 模型：{MODEL_CONFIG.base_model}")
     print("=" * 60)
 
     # 1. 加载模型

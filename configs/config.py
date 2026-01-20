@@ -1,15 +1,36 @@
 """
 全局配置文件
 面试点：配置管理的最佳实践
+
+模型架构（本地部署，不调用外部API）：
+- Teacher: DeepSeek-R1-Distill-Qwen-7B（蒸馏阶段生成CoT）
+- Judge: Qwen2.5-7B-Instruct（过滤、GRPO评分、评测判分）
+- Base: Qwen2.5-1.5B-Instruct（待训练的小模型）
 """
 import os
 from dataclasses import dataclass
 from typing import Optional
 
 @dataclass
+class TeacherModelConfig:
+    """Teacher 模型配置（用于蒸馏）"""
+    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    model_max_length: int = 2048
+    temperature: float = 0.6
+    max_new_tokens: int = 1024
+
+@dataclass
+class JudgeModelConfig:
+    """Judge 模型配置（用于评分和过滤）"""
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    model_max_length: int = 2048
+    temperature: float = 0.1  # 评分时用较低温度保证一致性
+    max_new_tokens: int = 512
+
+@dataclass
 class ModelConfig:
-    """模型配置"""
-    base_model: str = "Qwen/Qwen2.5-3B-Instruct"
+    """Base 模型配置（待训练的小模型）"""
+    base_model: str = "Qwen/Qwen2.5-1.5B-Instruct"
     model_max_length: int = 2048
 
 @dataclass
@@ -60,25 +81,32 @@ class GRPOConfig:
     accuracy_reward_weight: float = 0.7
 
 @dataclass
-class APIConfig:
-    """API 配置"""
-    provider: str = "deepseek"  # deepseek, qwen, openai
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
-    model_name: Optional[str] = None
+class LocalInferenceConfig:
+    """本地推理配置"""
+    # 量化配置
+    load_in_4bit: bool = True
+    bnb_4bit_quant_type: str = "nf4"
+    use_double_quant: bool = True
+    # GPU 配置
+    device_map: str = "auto"
+    gpu_memory_utilization: float = 0.9
 
-    def __post_init__(self):
-        # 从环境变量读取
-        if self.api_key is None:
-            self.api_key = os.getenv("API_KEY")
+@dataclass
+class WandbConfig:
+    """Wandb 配置"""
+    project: str = "FTModel-Training"  # wandb 项目名称
+    entity: Optional[str] = None  # wandb 团队名称（可选）
+    enabled: bool = True  # 是否启用 wandb
 
-        # 根据 provider 设置默认值
-        if self.provider == "deepseek":
-            self.base_url = self.base_url or "https://api.deepseek.com/v1"
-            self.model_name = self.model_name or "deepseek-chat"
-        elif self.provider == "qwen":
-            self.base_url = self.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            self.model_name = self.model_name or "qwen-max"
+    # 运行名称（自动生成）
+    run_name_sft: str = "sft-train"
+    run_name_grpo: str = "grpo-train"
+    run_name_eval: str = "evaluation"
+    run_name_ablation: str = "ablation-study"
+
+    # 日志配置
+    log_model: bool = False  # 是否上传模型到 wandb（通常很大，不建议）
+    log_interval: int = 10  # 日志记录间隔
 
 @dataclass
 class DataConfig:
@@ -106,9 +134,12 @@ class DataConfig:
             }
 
 # 全局配置实例
-MODEL_CONFIG = ModelConfig()
+TEACHER_CONFIG = TeacherModelConfig()  # Teacher: DeepSeek-R1-Distill-Qwen-7B
+JUDGE_CONFIG = JudgeModelConfig()      # Judge: Qwen2.5-7B-Instruct
+MODEL_CONFIG = ModelConfig()           # Base: Qwen2.5-1.5B-Instruct
 LORA_CONFIG = LoRAConfig()
 SFT_CONFIG = SFTConfig()
 GRPO_CONFIG = GRPOConfig()
-API_CONFIG = APIConfig()
+LOCAL_INFERENCE_CONFIG = LocalInferenceConfig()
+WANDB_CONFIG = WandbConfig()
 DATA_CONFIG = DataConfig()

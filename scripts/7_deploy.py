@@ -1,14 +1,18 @@
 """
-部署脚本
-支持三种操作：
-1. merge: 合并 LoRA 权重到基座模型
+T6 部署阶段：只部署最终 Base 模型
+Base 模型：Qwen2.5-1.5B-Instruct（训练后的最终模型）
+
+支持四种操作：
+1. merge: 合并 LoRA 权重到 Base 模型
 2. serve: 启动 vLLM OpenAI-compatible API 服务
 3. test: 测试部署的服务
+4. simple: 使用 Flask 启动简易服务（不需要 vLLM）
 
 面试点：
 - 为什么要合并 LoRA？部署时减少推理开销
 - vLLM 的优势：PagedAttention + Continuous batching
 - OpenAI API 兼容：便于集成
+- 只部署 Base 模型：小模型部署成本低，推理速度快
 """
 import argparse
 import json
@@ -373,7 +377,7 @@ def start_simple_server(
 # ============ 主函数 ============
 
 def main():
-    parser = argparse.ArgumentParser(description="金融推理模型部署")
+    parser = argparse.ArgumentParser(description="T6 部署阶段：只部署最终 Base 模型")
     parser.add_argument(
         "--action",
         type=str,

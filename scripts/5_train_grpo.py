@@ -1,8 +1,11 @@
 """
-GRPO 训练脚本
+T4 GRPO 训练阶段：Base 训练 + Judge 评分
+- Base 模型：Qwen2.5-1.5B-Instruct（训练）
+- Judge 模型：Qwen2.5-7B-Instruct（评分）
+
 核心技术点：
 1. 基于 SFT 模型继续训练
-2. 格式奖励 + 准确性奖励
+2. 格式奖励（规则）+ 准确性奖励（Judge 模型评分）
 3. TRL GRPOTrainer
 4. KL 散度约束
 
@@ -10,6 +13,7 @@ GRPO 训练脚本
 - GRPO vs PPO：GRPO 用组内相对表现计算优势，不需要 value network
 - 为什么双奖励：格式保证可解释性，准确性保证业务价值
 - KL 约束的作用：防止模型偏离 SFT 初始化太远，避免 reward hacking
+- 为什么用 Judge 模型评分：比规则更灵活，能评估推理质量
 """
 import json
 import os
@@ -25,15 +29,153 @@ from peft import PeftModel
 from trl import GRPOConfig, GRPOTrainer
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.config import MODEL_CONFIG, LORA_CONFIG, SFT_CONFIG, GRPO_CONFIG, DATA_CONFIG
+from configs.config import (
+    MODEL_CONFIG, LORA_CONFIG, SFT_CONFIG, GRPO_CONFIG, DATA_CONFIG,
+    JUDGE_CONFIG, LOCAL_INFERENCE_CONFIG, WANDB_CONFIG
+)
+
+
+# ============ Judge 模型 ============
+
+class JudgeModel:
+    """
+    Judge 模型封装（用于 GRPO 评分）
+    """
+
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+
+    def load(self):
+        """加载 Judge 模型（Qwen2.5-7B-Instruct）"""
+        print("=" * 60)
+        print("加载 Judge 模型（用于 GRPO 评分）")
+        print("=" * 60)
+        print(f"模型: {JUDGE_CONFIG.model_name}")
+
+        # 4bit 量化配置
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=LOCAL_INFERENCE_CONFIG.load_in_4bit,
+            bnb_4bit_quant_type=LOCAL_INFERENCE_CONFIG.bnb_4bit_quant_type,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=LOCAL_INFERENCE_CONFIG.use_double_quant,
+        )
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            JUDGE_CONFIG.model_name,
+            quantization_config=bnb_config,
+            device_map="cuda:0",  # Judge 模型放在第一个 GPU
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            JUDGE_CONFIG.model_name,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model.eval()
+        print("✓ Judge 模型加载完成")
+
+    def unload(self):
+        """释放 GPU 显存"""
+        if self.model is not None:
+            del self.model
+            del self.tokenizer
+            self.model = None
+            self.tokenizer = None
+            torch.cuda.empty_cache()
+
+    def score_response(self, question: str, response: str, gold_answer: str, qtype: str) -> float:
+        """
+        使用 Judge 模型评分
+        返回：0.0-1.0 的分数
+        """
+        prompt = f"""请评估以下金融问题回答的质量。
+
+问题：{question}
+题目类型：{qtype}
+标准答案：{gold_answer}
+
+模型回答：
+{response}
+
+请评估回答质量（满分10分）：
+1. 答案正确性（0-4分）：答案是否正确
+2. 推理质量（0-3分）：推理过程是否清晰、完整
+3. 格式规范（0-3分）：是否符合 <think>...</think><answer>...</answer> 格式
+
+请只输出一个数字（0-10的整数），表示总分。不要输出其他内容。"""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=10,
+                    temperature=JUDGE_CONFIG.temperature,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+
+            response_text = self.tokenizer.decode(
+                outputs[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True
+            ).strip()
+
+            # 提取分数
+            score_match = re.search(r'(\d+)', response_text)
+            if score_match:
+                score = int(score_match.group(1))
+                return min(max(score / 10.0, 0.0), 1.0)  # 归一化到 0-1
+
+            return 0.5  # 解析失败时返回中间值
+
+        except Exception as e:
+            print(f"Judge 评分失败: {e}")
+            return 0.5
+
+
+# 全局 Judge 模型实例
+_judge_model = None
+
+
+def get_judge_model():
+    """获取全局 Judge 模型实例"""
+    global _judge_model
+    if _judge_model is None:
+        _judge_model = JudgeModel()
+        _judge_model.load()
+    return _judge_model
+
+
+def cleanup_judge_model():
+    """清理全局 Judge 模型"""
+    global _judge_model
+    if _judge_model is not None:
+        _judge_model.unload()
+        _judge_model = None
 
 
 # ============ 奖励函数 ============
 
 def compute_format_reward(responses: List[str]) -> List[float]:
     """
-    格式奖励函数
-    面试点：检查 <think> 和 <answer> 标签的完整性和顺序
+    格式奖励函数（规则）
+    检查 <think> 和 <answer> 标签的完整性和顺序
 
     奖励标准：
     - 完整标签且顺序正确：1.0
@@ -112,19 +254,13 @@ def check_answer_qa(extracted: str, gold: str) -> bool:
     return overlap_ratio > 0.5
 
 
-def compute_accuracy_reward(
+def compute_accuracy_reward_rule(
     responses: List[str],
     gold_answers: List[str],
     types: List[str]
 ) -> List[float]:
     """
-    准确性奖励函数
-    面试点：根据题目类型使用不同的评判标准
-
-    奖励标准：
-    - 完全正确：1.0
-    - 部分正确（QA 题）：0.5
-    - 错误：0.0
+    准确性奖励函数（规则版本，作为备用）
     """
     rewards = []
     for response, gold, qtype in zip(responses, gold_answers, types):
@@ -135,36 +271,68 @@ def compute_accuracy_reward(
             continue
 
         if qtype == "financial_calculation":
-            # 数值题：严格匹配
             if check_answer_math(extracted, gold):
                 rewards.append(1.0)
             else:
                 rewards.append(0.0)
         else:
-            # QA 题：关键词匹配
             if check_answer_qa(extracted, gold):
                 rewards.append(1.0)
             elif len(set(gold.split()) & set(extracted.split())) > 0:
-                rewards.append(0.3)  # 部分相关
+                rewards.append(0.3)
             else:
                 rewards.append(0.0)
 
     return rewards
 
 
+def compute_accuracy_reward_judge(
+    responses: List[str],
+    prompts: List[str],
+    gold_answers: List[str],
+    types: List[str]
+) -> List[float]:
+    """
+    准确性奖励函数（Judge 模型评分）
+    """
+    judge = get_judge_model()
+    rewards = []
+
+    for response, prompt, gold, qtype in zip(responses, prompts, gold_answers, types):
+        score = judge.score_response(
+            question=prompt,
+            response=response,
+            gold_answer=gold,
+            qtype=qtype
+        )
+        rewards.append(score)
+
+    return rewards
+
+
 def combined_reward_function(
     completions: List[str],
+    prompts: List[str],
     gold_answers: List[str],
     types: List[str],
+    use_judge: bool = True,
 ) -> List[float]:
     """
     组合奖励函数
-    面试点：Fin-R1 的奖励设计
+    格式奖励（规则）+ 准确性奖励（Judge 或规则）
 
     组合方式：0.3 * 格式奖励 + 0.7 * 准确性奖励
     """
     format_rewards = compute_format_reward(completions)
-    accuracy_rewards = compute_accuracy_reward(completions, gold_answers, types)
+
+    if use_judge:
+        accuracy_rewards = compute_accuracy_reward_judge(
+            completions, prompts, gold_answers, types
+        )
+    else:
+        accuracy_rewards = compute_accuracy_reward_rule(
+            completions, gold_answers, types
+        )
 
     combined = [
         GRPO_CONFIG.format_reward_weight * f + GRPO_CONFIG.accuracy_reward_weight * a
@@ -178,11 +346,10 @@ def combined_reward_function(
 
 def load_sft_model():
     """
-    加载 SFT 训练后的模型
-    面试点：如何加载 LoRA adapter
+    加载 SFT 训练后的 Base 模型
     """
     print("=" * 60)
-    print("加载 SFT 模型")
+    print("加载 SFT 模型（Base）")
     print("=" * 60)
 
     # 4bit 量化配置
@@ -223,7 +390,7 @@ def load_sft_model():
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    print(f"✓ 模型加载完成")
+    print(f"✓ Base 模型加载完成")
 
     return model, tokenizer
 
@@ -231,7 +398,6 @@ def load_sft_model():
 def load_rl_data():
     """
     加载 RL 训练数据
-    面试点：GRPO 数据格式要求
     """
     print("\n" + "=" * 60)
     print("加载 RL 数据")
@@ -257,35 +423,9 @@ def load_rl_data():
     return dataset
 
 
-# ============ 自定义 GRPO Trainer ============
-
-class FinanceGRPOTrainer(GRPOTrainer):
-    """
-    自定义 GRPO Trainer
-    重写奖励计算方法以支持金融领域的双重奖励
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-
-    def compute_rewards(self, prompts, completions, **kwargs):
-        """
-        计算奖励
-        这里我们使用自定义的组合奖励函数
-        """
-        # 从 batch 中提取 gold_answer 和 type
-        gold_answers = kwargs.get("gold_answers", [""] * len(completions))
-        types = kwargs.get("types", ["business_reasoning"] * len(completions))
-
-        rewards = combined_reward_function(completions, gold_answers, types)
-
-        return torch.tensor(rewards, device=self.accelerator.device)
-
-
-def create_reward_function(dataset):
+def create_reward_function(dataset, use_judge=True):
     """
     创建奖励函数闭包
-    用于在 GRPOTrainer 中计算奖励
     """
     # 创建 prompt 到 gold_answer 和 type 的映射
     prompt_to_meta = {}
@@ -303,38 +443,83 @@ def create_reward_function(dataset):
         # 获取元数据
         gold_answers = []
         types = []
+        prompt_list = []
 
         if prompts is not None:
             for prompt in prompts:
                 meta = prompt_to_meta.get(prompt, {"gold_answer": "", "type": "business_reasoning"})
                 gold_answers.append(meta["gold_answer"])
                 types.append(meta["type"])
+                prompt_list.append(prompt)
         else:
             gold_answers = [""] * len(completions)
             types = ["business_reasoning"] * len(completions)
+            prompt_list = [""] * len(completions)
 
         # 计算组合奖励
-        rewards = combined_reward_function(completions, gold_answers, types)
+        rewards = combined_reward_function(
+            completions, prompt_list, gold_answers, types, use_judge=use_judge
+        )
 
         return rewards
 
     return reward_fn
 
 
-def train_grpo(model, tokenizer, dataset):
+def train_grpo(model, tokenizer, dataset, use_judge=True):
     """
     执行 GRPO 训练
-    面试点：GRPOTrainer 的配置
     """
     print("\n" + "=" * 60)
     print("开始 GRPO 训练")
+    print(f"Judge 模型评分: {'启用' if use_judge else '禁用（使用规则评分）'}")
     print("=" * 60)
+
+    # 初始化 wandb
+    if WANDB_CONFIG.enabled:
+        try:
+            import wandb
+            from datetime import datetime
+
+            run_name = f"{WANDB_CONFIG.run_name_grpo}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            wandb.init(
+                project=WANDB_CONFIG.project,
+                entity=WANDB_CONFIG.entity,
+                name=run_name,
+                config={
+                    "model": MODEL_CONFIG.base_model,
+                    "sft_checkpoint": SFT_CONFIG.output_dir,
+                    "use_judge": use_judge,
+                    "epochs": GRPO_CONFIG.num_train_epochs,
+                    "batch_size": GRPO_CONFIG.per_device_train_batch_size,
+                    "gradient_accumulation": GRPO_CONFIG.gradient_accumulation_steps,
+                    "learning_rate": GRPO_CONFIG.learning_rate,
+                    "num_generations": GRPO_CONFIG.num_sample_generations,
+                    "temperature": GRPO_CONFIG.temperature,
+                    "kl_coef": GRPO_CONFIG.kl_coef,
+                    "format_reward_weight": GRPO_CONFIG.format_reward_weight,
+                    "accuracy_reward_weight": GRPO_CONFIG.accuracy_reward_weight,
+                },
+                tags=["grpo", "reinforcement-learning", "judge-scoring" if use_judge else "rule-scoring"],
+            )
+            print(f"✓ Wandb 已初始化: {run_name}")
+            report_to = "wandb"
+        except ImportError:
+            print("⚠️  wandb 未安装，跳过 wandb 日志")
+            report_to = "none"
+    else:
+        print("ℹ️  Wandb 未启用")
+        report_to = "none"
 
     # 创建输出目录
     os.makedirs(GRPO_CONFIG.output_dir, exist_ok=True)
 
+    # 初始化 Judge 模型（如果启用）
+    if use_judge:
+        get_judge_model()
+
     # 创建奖励函数
-    reward_fn = create_reward_function(dataset)
+    reward_fn = create_reward_function(dataset, use_judge=use_judge)
 
     # GRPO 配置
     grpo_config = GRPOConfig(
@@ -344,7 +529,7 @@ def train_grpo(model, tokenizer, dataset):
         gradient_accumulation_steps=GRPO_CONFIG.gradient_accumulation_steps,
         learning_rate=GRPO_CONFIG.learning_rate,
         # GRPO 特定参数
-        num_generations=GRPO_CONFIG.num_sample_generations,  # 每个 prompt 生成多少个样本
+        num_generations=GRPO_CONFIG.num_sample_generations,
         max_completion_length=GRPO_CONFIG.response_length,
         temperature=GRPO_CONFIG.temperature,
         # 其他参数
@@ -352,12 +537,12 @@ def train_grpo(model, tokenizer, dataset):
         save_steps=50,
         save_total_limit=2,
         bf16=True,
-        report_to="none",
+        report_to=report_to,  # wandb 日志
         gradient_checkpointing=True,
-        remove_unused_columns=False,  # 保留额外字段
+        remove_unused_columns=False,
     )
 
-    # 准备数据集格式（GRPOTrainer 需要 "prompt" 字段）
+    # 准备数据集格式
     def format_prompt(example):
         return {"prompt": example["prompt"]}
 
@@ -369,7 +554,7 @@ def train_grpo(model, tokenizer, dataset):
         args=grpo_config,
         train_dataset=formatted_dataset,
         processing_class=tokenizer,
-        reward_funcs=reward_fn,  # 奖励函数
+        reward_funcs=reward_fn,
     )
 
     # 打印配置
@@ -393,6 +578,14 @@ def train_grpo(model, tokenizer, dataset):
 
     print(f"\n✅ GRPO 训练完成！")
     print(f"   模型已保存至: {GRPO_CONFIG.output_dir}")
+
+    # 结束 wandb
+    if WANDB_CONFIG.enabled:
+        try:
+            import wandb
+            wandb.finish()
+        except:
+            pass
 
     return trainer
 
@@ -443,8 +636,23 @@ def test_generation(model, tokenizer):
 
 def main():
     """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="T4 GRPO 训练阶段")
+    parser.add_argument(
+        "--no-judge",
+        action="store_true",
+        help="不使用 Judge 模型评分（使用规则评分）"
+    )
+    args = parser.parse_args()
+
+    use_judge = not args.no_judge
+
     print("=" * 60)
-    print("金融推理模型 GRPO 训练")
+    print("T4 GRPO 训练阶段：Base 训练 + Judge 评分")
+    print(f"Base 模型：{MODEL_CONFIG.base_model}")
+    print(f"Judge 模型：{JUDGE_CONFIG.model_name}")
+    print(f"Judge 评分：{'启用' if use_judge else '禁用'}")
     print("=" * 60)
 
     # 检查 SFT 模型是否存在
@@ -453,17 +661,22 @@ def main():
         print("   请先运行 python scripts/4_train_sft.py")
         sys.exit(1)
 
-    # 1. 加载模型
-    model, tokenizer = load_sft_model()
+    try:
+        # 1. 加载 Base 模型
+        model, tokenizer = load_sft_model()
 
-    # 2. 加载数据
-    dataset = load_rl_data()
+        # 2. 加载数据
+        dataset = load_rl_data()
 
-    # 3. GRPO 训练
-    trainer = train_grpo(model, tokenizer, dataset)
+        # 3. GRPO 训练
+        trainer = train_grpo(model, tokenizer, dataset, use_judge=use_judge)
 
-    # 4. 测试生成
-    test_generation(model, tokenizer)
+        # 4. 测试生成
+        test_generation(model, tokenizer)
+
+    finally:
+        # 清理 Judge 模型
+        cleanup_judge_model()
 
     print("\n" + "=" * 60)
     print("✅ GRPO 训练全部完成！")

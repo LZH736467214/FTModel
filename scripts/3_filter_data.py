@@ -1,5 +1,11 @@
 """
-双重过滤：答案正确性 + 推理质量
+T2 过滤阶段：Judge 模型 + 规则脚本
+Judge 模型：Qwen2.5-7B-Instruct（本地部署）
+
+双重过滤：
+1. 规则过滤：格式检查、答案正确性
+2. Judge 过滤：推理质量评估（使用 Judge 模型打分）
+
 输出：data/processed/sft.jsonl, data/processed/rl.jsonl
 """
 import json
@@ -7,25 +13,181 @@ import os
 import sys
 import re
 from pathlib import Path
+from tqdm import tqdm
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.config import DATA_CONFIG
+from configs.config import DATA_CONFIG, JUDGE_CONFIG, LOCAL_INFERENCE_CONFIG
+
+
+class JudgeModel:
+    """
+    Judge 模型封装
+    用于评估推理质量
+    """
+
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+
+    def load(self):
+        """加载 Judge 模型（Qwen2.5-7B-Instruct）"""
+        from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+        print("=" * 60)
+        print("加载 Judge 模型")
+        print("=" * 60)
+        print(f"模型: {JUDGE_CONFIG.model_name}")
+
+        # 4bit 量化配置
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=LOCAL_INFERENCE_CONFIG.load_in_4bit,
+            bnb_4bit_quant_type=LOCAL_INFERENCE_CONFIG.bnb_4bit_quant_type,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=LOCAL_INFERENCE_CONFIG.use_double_quant,
+        )
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            JUDGE_CONFIG.model_name,
+            quantization_config=bnb_config,
+            device_map=LOCAL_INFERENCE_CONFIG.device_map,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16,
+        )
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            JUDGE_CONFIG.model_name,
+            trust_remote_code=True,
+            padding_side="left",
+        )
+
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model.eval()
+        print("✓ Judge 模型加载完成")
+
+    def unload(self):
+        """释放 GPU 显存"""
+        if self.model is not None:
+            del self.model
+            del self.tokenizer
+            self.model = None
+            self.tokenizer = None
+            torch.cuda.empty_cache()
+
+    def evaluate_reasoning(self, question, reasoning, answer, qtype):
+        """
+        使用 Judge 模型评估推理质量
+        返回：(通过/不通过, 评分, 原因)
+        """
+        prompt = f"""请评估以下金融问题的推理过程质量。
+
+问题：{question}
+题目类型：{qtype}
+
+推理过程：
+{reasoning}
+
+给出的答案：{answer}
+
+请从以下维度评估（每项1-5分）：
+1. 逻辑清晰度：推理步骤是否清晰、有条理
+2. 专业准确性：金融概念和计算是否正确
+3. 完整性：推理是否覆盖了所有必要步骤
+4. 简洁性：是否有冗余或无关内容
+
+请严格按以下格式输出：
+逻辑清晰度：X分
+专业准确性：X分
+完整性：X分
+简洁性：X分
+总分：XX分（满分20分）
+是否通过：是/否（总分>=12分为通过）
+评估理由：[简短说明]"""
+
+        messages = [{"role": "user", "content": prompt}]
+
+        text = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.model.device)
+
+        try:
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=JUDGE_CONFIG.max_new_tokens,
+                    temperature=JUDGE_CONFIG.temperature,
+                    do_sample=False,  # 评分时不采样，保证一致性
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+
+            response = self.tokenizer.decode(
+                outputs[0][inputs["input_ids"].shape[1]:],
+                skip_special_tokens=True
+            )
+
+            # 解析评估结果
+            return self._parse_evaluation(response)
+
+        except Exception as e:
+            return False, 0, f"Judge 评估失败: {str(e)}"
+
+    def _parse_evaluation(self, response):
+        """解析 Judge 模型的评估结果"""
+        try:
+            # 提取总分
+            score_match = re.search(r'总分[：:]\s*(\d+)', response)
+            total_score = int(score_match.group(1)) if score_match else 0
+
+            # 提取是否通过
+            pass_match = re.search(r'是否通过[：:]\s*(是|否)', response)
+            is_pass = pass_match.group(1) == "是" if pass_match else (total_score >= 12)
+
+            # 提取理由
+            reason_match = re.search(r'评估理由[：:]\s*(.+?)(?:\n|$)', response, re.DOTALL)
+            reason = reason_match.group(1).strip() if reason_match else "无"
+
+            return is_pass, total_score, reason
+
+        except Exception:
+            # 解析失败时，默认通过（保守策略）
+            return True, 12, "评估解析失败，默认通过"
+
 
 class DataFilter:
     """
     数据过滤器
-    面试点：Fin-R1 的过滤策略
+    结合规则过滤和 Judge 模型过滤
     """
 
-    def __init__(self):
+    def __init__(self, use_judge=True):
+        self.use_judge = use_judge
+        self.judge_model = None
         self.stats = {
             "total": 0,
             "format_ok": 0,
             "answer_correct": 0,
             "reasoning_good": 0,
+            "judge_pass": 0,
             "final_pass": 0,
             "filter_reasons": {}
         }
+
+    def init_judge(self):
+        """初始化 Judge 模型"""
+        if self.use_judge:
+            self.judge_model = JudgeModel()
+            self.judge_model.load()
+
+    def cleanup_judge(self):
+        """清理 Judge 模型"""
+        if self.judge_model:
+            self.judge_model.unload()
 
     def extract_answer(self, text):
         """提取 <answer> 中的内容"""
@@ -47,7 +209,7 @@ class DataFilter:
         match = re.search(r'<think>(.*?)</think>', text, re.DOTALL)
         return match.group(1).strip() if match else None
 
-    # ========== 第一层：格式检查 ==========
+    # ========== 第一层：格式检查（规则）==========
 
     def check_format(self, text):
         """检查格式是否符合要求"""
@@ -66,7 +228,7 @@ class DataFilter:
 
         return True, "OK"
 
-    # ========== 第二层：答案正确性 ==========
+    # ========== 第二层：答案正确性（规则）==========
 
     def check_answer_math(self, extracted, gold):
         """数学题答案检查"""
@@ -121,12 +283,11 @@ class DataFilter:
 
         return is_correct, "OK" if is_correct else "答案不正确"
 
-    # ========== 第三层：推理质量 ==========
+    # ========== 第三层：推理质量（规则 + Judge）==========
 
-    def check_reasoning_quality(self, item):
+    def check_reasoning_quality_rules(self, item):
         """
-        推理质量检查
-        面试点：Fin-R1 用 7 个维度，我们简化为 4 个核心维度
+        推理质量检查（规则部分）
         """
         think_text = self.extract_think(item["teacher_output"])
 
@@ -164,16 +325,35 @@ class DataFilter:
 
         return True, "OK"
 
+    def check_reasoning_quality_judge(self, item):
+        """
+        推理质量检查（Judge 模型）
+        """
+        if not self.judge_model:
+            return True, 12, "Judge 未启用"
+
+        think_text = self.extract_think(item["teacher_output"])
+        answer_text = self.extract_answer(item["teacher_output"])
+
+        is_pass, score, reason = self.judge_model.evaluate_reasoning(
+            question=item["question"],
+            reasoning=think_text or "",
+            answer=answer_text or "",
+            qtype=item["type"]
+        )
+
+        return is_pass, score, reason
+
     # ========== 主流程 ==========
 
-    def filter_item(self, item):
+    def filter_item(self, item, use_judge_for_this_item=True):
         """过滤单条数据"""
         # 第一层：格式
         format_ok, format_reason = self.check_format(item["teacher_output"])
         if not format_ok:
             self.stats["filter_reasons"][format_reason] = \
                 self.stats["filter_reasons"].get(format_reason, 0) + 1
-            return False
+            return False, format_reason
 
         self.stats["format_ok"] += 1
 
@@ -182,21 +362,32 @@ class DataFilter:
         if not answer_ok:
             self.stats["filter_reasons"][answer_reason] = \
                 self.stats["filter_reasons"].get(answer_reason, 0) + 1
-            return False
+            return False, answer_reason
 
         self.stats["answer_correct"] += 1
 
-        # 第三层：推理质量
-        quality_ok, quality_reason = self.check_reasoning_quality(item)
+        # 第三层：推理质量（规则）
+        quality_ok, quality_reason = self.check_reasoning_quality_rules(item)
         if not quality_ok:
             self.stats["filter_reasons"][quality_reason] = \
                 self.stats["filter_reasons"].get(quality_reason, 0) + 1
-            return False
+            return False, quality_reason
 
         self.stats["reasoning_good"] += 1
+
+        # 第四层：推理质量（Judge 模型）
+        if self.use_judge and use_judge_for_this_item:
+            judge_ok, judge_score, judge_reason = self.check_reasoning_quality_judge(item)
+            if not judge_ok:
+                reason = f"Judge 评分不通过 ({judge_score}/20): {judge_reason}"
+                self.stats["filter_reasons"][reason[:50]] = \
+                    self.stats["filter_reasons"].get(reason[:50], 0) + 1
+                return False, reason
+            self.stats["judge_pass"] += 1
+
         self.stats["final_pass"] += 1
 
-        return True
+        return True, "OK"
 
     def filter_all(self, data):
         """过滤所有数据"""
@@ -205,8 +396,11 @@ class DataFilter:
         sft_data = []
         rl_data = []
 
-        for item in data:
-            if self.filter_item(item):
+        print("\n执行过滤...")
+        for item in tqdm(data, desc="过滤进度"):
+            passed, reason = self.filter_item(item)
+
+            if passed:
                 # SFT 数据
                 sft_data.append({
                     "id": item["id"],
@@ -227,30 +421,32 @@ class DataFilter:
 
     def print_report(self):
         """打印过滤报告"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("数据过滤报告")
-        print("="*60)
+        print("=" * 60)
         print(f"{'指标':<20s} {'数量':>10s} {'占比':>10s}")
-        print("-"*60)
+        print("-" * 60)
         print(f"{'原始样本':<20s} {self.stats['total']:>10d} {100.0:>9.1f}%")
         print(f"{'格式正确':<20s} {self.stats['format_ok']:>10d} {self.stats['format_ok']/self.stats['total']*100:>9.1f}%")
         print(f"{'答案正确':<20s} {self.stats['answer_correct']:>10d} {self.stats['answer_correct']/self.stats['total']*100:>9.1f}%")
-        print(f"{'推理合格':<20s} {self.stats['reasoning_good']:>10d} {self.stats['reasoning_good']/self.stats['total']*100:>9.1f}%")
+        print(f"{'推理合格(规则)':<20s} {self.stats['reasoning_good']:>10d} {self.stats['reasoning_good']/self.stats['total']*100:>9.1f}%")
+        if self.use_judge:
+            print(f"{'Judge通过':<20s} {self.stats['judge_pass']:>10d} {self.stats['judge_pass']/self.stats['total']*100:>9.1f}%")
         print(f"{'最终通过':<20s} {self.stats['final_pass']:>10d} {self.stats['final_pass']/self.stats['total']*100:>9.1f}%")
-        print("="*60)
+        print("=" * 60)
 
         if self.stats["filter_reasons"]:
             print("\n过滤原因分布:")
             for reason, count in sorted(self.stats["filter_reasons"].items(),
                                        key=lambda x: -x[1]):
-                print(f"  {reason:<30s}: {count:>5d}")
+                print(f"  {reason:<40s}: {count:>5d}")
 
-        print("="*60)
+        print("=" * 60)
+
 
 def split_train_test(sft_data, rl_data, test_ratio=0.2):
     """
     切分训练集和测试集
-    面试点：如何避免数据泄漏
     """
     import random
     random.seed(42)
@@ -275,11 +471,12 @@ def split_train_test(sft_data, rl_data, test_ratio=0.2):
 
     return sft_train, sft_test, rl_train, rl_test
 
-def filter_data():
+
+def filter_data(use_judge=True):
     """主流程"""
-    print("="*60)
-    print("阶段3：双重过滤（答案 + 推理质量）")
-    print("="*60)
+    print("=" * 60)
+    print("T2 过滤阶段：Judge 模型 + 规则脚本")
+    print("=" * 60)
 
     # 加载蒸馏数据
     print(f"\n加载蒸馏数据: {DATA_CONFIG.distilled_data_path}")
@@ -287,13 +484,23 @@ def filter_data():
         distilled_data = [json.loads(line) for line in f]
     print(f"✓ 加载 {len(distilled_data)} 条")
 
-    # 过滤
-    print("\n执行过滤...")
-    filter_obj = DataFilter()
-    sft_data, rl_data = filter_obj.filter_all(distilled_data)
+    # 初始化过滤器
+    filter_obj = DataFilter(use_judge=use_judge)
 
-    # 打印报告
-    filter_obj.print_report()
+    # 加载 Judge 模型
+    if use_judge:
+        filter_obj.init_judge()
+
+    try:
+        # 过滤
+        sft_data, rl_data = filter_obj.filter_all(distilled_data)
+
+        # 打印报告
+        filter_obj.print_report()
+
+    finally:
+        # 清理 Judge 模型
+        filter_obj.cleanup_judge()
 
     # 切分训练/测试集
     print("\n切分训练/测试集...")
@@ -329,8 +536,23 @@ def filter_data():
 
     return len(sft_train), len(rl_train), len(sft_test)
 
+
 if __name__ == "__main__":
-    sft_count, rl_count, test_count = filter_data()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="T2 过滤阶段")
+    parser.add_argument(
+        "--no-judge",
+        action="store_true",
+        help="不使用 Judge 模型（仅使用规则过滤）"
+    )
+    args = parser.parse_args()
+
+    use_judge = not args.no_judge
+
+    print(f"Judge 模型: {'启用' if use_judge else '禁用'}")
+
+    sft_count, rl_count, test_count = filter_data(use_judge=use_judge)
     print(f"\n✅ 数据构建完成！")
     print(f"   最终数据资产：SFT {sft_count} 条 + RL {rl_count} 条 + 测试 {test_count} 条")
-    print(f"\n下一步：上传到服务器并开始训练")
+    print(f"\n下一步：运行 python scripts/4_train_sft.py")

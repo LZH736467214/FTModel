@@ -1,5 +1,7 @@
 """
-用教师模型生成 CoT
+T1 蒸馏阶段：用本地 Teacher 模型生成 CoT
+Teacher 模型：DeepSeek-R1-Distill-Qwen-7B（本地部署，不调用外部 API）
+
 输出：data/processed/distilled.jsonl
 """
 import json
@@ -7,30 +9,57 @@ import os
 import sys
 from pathlib import Path
 from tqdm import tqdm
-import time
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from configs.config import DATA_CONFIG, API_CONFIG
+from configs.config import DATA_CONFIG, TEACHER_CONFIG, LOCAL_INFERENCE_CONFIG
 
-def get_api_client():
+
+def load_teacher_model():
     """
-    获取 API 客户端
-    面试点：API 调用的通用封装
+    加载本地 Teacher 模型（DeepSeek-R1-Distill-Qwen-7B）
+    使用 4bit 量化以节省显存
     """
-    from openai import OpenAI
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-    if not API_CONFIG.api_key:
-        print("⚠️  未设置 API_KEY")
-        print("请设置环境变量：export API_KEY=your_api_key")
-        print("或在 configs/config.py 中配置")
-        sys.exit(1)
+    print("=" * 60)
+    print("加载 Teacher 模型")
+    print("=" * 60)
+    print(f"模型: {TEACHER_CONFIG.model_name}")
 
-    client = OpenAI(
-        api_key=API_CONFIG.api_key,
-        base_url=API_CONFIG.base_url
+    # 4bit 量化配置
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=LOCAL_INFERENCE_CONFIG.load_in_4bit,
+        bnb_4bit_quant_type=LOCAL_INFERENCE_CONFIG.bnb_4bit_quant_type,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=LOCAL_INFERENCE_CONFIG.use_double_quant,
     )
 
-    return client
+    # 加载模型
+    model = AutoModelForCausalLM.from_pretrained(
+        TEACHER_CONFIG.model_name,
+        quantization_config=bnb_config,
+        device_map=LOCAL_INFERENCE_CONFIG.device_map,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
+
+    # 加载分词器
+    tokenizer = AutoTokenizer.from_pretrained(
+        TEACHER_CONFIG.model_name,
+        trust_remote_code=True,
+        padding_side="left",
+    )
+
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    model.eval()
+    print(f"✓ Teacher 模型加载完成")
+
+    return model, tokenizer
+
 
 def create_distillation_prompt(question, qtype):
     """
@@ -61,44 +90,56 @@ def create_distillation_prompt(question, qtype):
 
     return system_prompt, user_prompt
 
-def call_teacher_model(client, question, qtype, max_retries=3):
+
+def call_teacher_model(model, tokenizer, question, qtype):
     """
-    调用教师模型
-    面试点：错误处理和重试机制
+    使用本地 Teacher 模型生成 CoT
     """
     system_prompt, user_prompt = create_distillation_prompt(question, qtype)
 
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model=API_CONFIG.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.6,
-                max_tokens=1024
+    # 构造消息
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    # 使用 chat template 格式化
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+    try:
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=TEACHER_CONFIG.max_new_tokens,
+                temperature=TEACHER_CONFIG.temperature,
+                do_sample=True,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
             )
 
-            output = response.choices[0].message.content
-            return output, None
+        # 解码输出（只取生成的部分）
+        response = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )
 
-        except Exception as e:
-            error_msg = str(e)
-            if attempt < max_retries - 1:
-                wait_time = 2 ** attempt  # 指数退避
-                print(f"   ⚠️  重试 {attempt+1}/{max_retries}（等待 {wait_time}s）: {error_msg[:50]}")
-                time.sleep(wait_time)
-            else:
-                return None, error_msg
+        return response, None
 
-    return None, "Max retries exceeded"
+    except Exception as e:
+        return None, str(e)
+
 
 def distill_data():
     """主流程"""
-    print("="*60)
-    print("阶段2：数据蒸馏（Teacher 生成 CoT）")
-    print("="*60)
+    print("=" * 60)
+    print("T1 蒸馏阶段：Teacher 生成 CoT（本地推理）")
+    print("=" * 60)
 
     # 加载原始数据
     print(f"\n加载原始数据: {DATA_CONFIG.raw_data_path}")
@@ -106,10 +147,8 @@ def distill_data():
         raw_data = [json.loads(line) for line in f]
     print(f"✓ 加载 {len(raw_data)} 条")
 
-    # 初始化 API
-    print(f"\n初始化 API: {API_CONFIG.provider}")
-    client = get_api_client()
-    print(f"✓ 使用模型: {API_CONFIG.model_name}")
+    # 加载本地 Teacher 模型
+    model, tokenizer = load_teacher_model()
 
     # 蒸馏
     distilled_data = []
@@ -118,7 +157,8 @@ def distill_data():
     print(f"\n开始蒸馏...")
     for item in tqdm(raw_data, desc="蒸馏进度"):
         teacher_output, error = call_teacher_model(
-            client,
+            model,
+            tokenizer,
             item["question"],
             item["type"]
         )
@@ -157,28 +197,33 @@ def distill_data():
             for item in failed_items:
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
+    # 释放 GPU 显存
+    del model
+    torch.cuda.empty_cache()
+
     # 统计
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("蒸馏结果")
-    print("="*60)
+    print("=" * 60)
     print(f"总数: {len(raw_data)}")
     print(f"成功: {len(distilled_data)} ({len(distilled_data)/len(raw_data)*100:.1f}%)")
     print(f"失败: {len(failed_items)} ({len(failed_items)/len(raw_data)*100:.1f}%)")
-    print("="*60)
+    print("=" * 60)
 
     print(f"\n✅ 蒸馏数据已保存至: {output_path}")
 
     # 展示一个样例
     if distilled_data:
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("样例展示")
-        print("="*60)
+        print("=" * 60)
         sample = distilled_data[0]
         print(f"问题: {sample['question']}")
         print(f"\n教师输出:\n{sample['teacher_output']}")
-        print("="*60)
+        print("=" * 60)
 
     return len(distilled_data)
+
 
 if __name__ == "__main__":
     count = distill_data()
