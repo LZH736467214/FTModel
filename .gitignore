@@ -1,0 +1,21 @@
+# 模型权重
+ckpts/
+*.bin
+*.safetensors
+
+# 数据文件
+data/
+!data/.gitkeep
+
+# 日志
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# IDE
+.vscode/
+.idea/
