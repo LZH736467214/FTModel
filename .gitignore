@@ -2,6 +2,7 @@
 ckpts/
 *.bin
 *.safetensors
+models/
 
 # 数据文件
 data/
