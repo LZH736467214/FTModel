@@ -1,28 +1,28 @@
 # 核心框架 (RTX 5090 优化版本)
-torch==2.6.0  # 支持 CUDA 12.x，适配 RTX 5090
-transformers==4.47.0  # 更新至最新稳定版本
-trl==0.13.0  # 兼容新版 transformers
-peft==0.14.0  # 兼容新版 transformers
+torch==2.7.0  # 支持 CUDA 12.x，适配 RTX 5090
+transformers==4.48.0  # 最新稳定版本，完全兼容 torch 2.7.0
+trl==0.14.0  # 兼容新版 transformers 和 torch
+peft==0.15.0  # 兼容新版 transformers 和 torch
 
 # 量化和加速
-bitsandbytes==0.45.0  # 更新以支持新版 CUDA
-accelerate==0.36.0  # 更新以支持新版 PyTorch
+bitsandbytes==0.45.1  # 支持 CUDA 12.x 和 RTX 5090
+accelerate==1.2.1  # 兼容 torch 2.7.0
 
 # 部署
-vllm==0.6.5  # 更新以支持 RTX 5090
+vllm==0.6.6.post1  # 支持 RTX 5090 和 torch 2.7.0
 
 # 数据处理
-datasets==3.3.0  # 更新至最新版本，兼容新版 transformers
-pandas==2.2.0  # 更新至稳定版本
+datasets==3.3.1  # 最新版本，兼容新版 transformers
+pandas==2.2.3  # 最新稳定版本
 
 # API 调用
-openai==1.59.7  # 更新至最新版本
-requests==2.32.3  # 更新至稳定版本
+openai==1.61.2  # 最新版本
+requests==2.32.3  # 最新稳定版本
 
 # 工具
-tqdm==4.67.1  # 更新至最新版本
-wandb>=0.18.0  # 可选，用于训练监控
+tqdm==4.67.1  # 最新版本
+wandb>=0.19.1  # 可选，用于训练监控
 
 # Qwen 特定
 sentencepiece==0.2.0  # 保持不变
-protobuf==5.29.3  # 更新以兼容新版包
+protobuf==5.29.3  # 最新版本，兼容所有包
