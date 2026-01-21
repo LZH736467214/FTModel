@@ -24,4 +24,4 @@ __pycache__/
 # 过程记录文件
 .detect_plan.md
 .preparation.md
-.plans/
+plans/
